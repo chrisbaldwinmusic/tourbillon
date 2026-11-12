@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Checks Tourbillon's bucket-brigade model (Source/DSP/BucketBrigade.h, shared with Reverie) against the same
-signal path built as a circuit and solved by ngspice, with the chips Tourbillon fits: one 512-bucket chip and no
-compander, clocked up to 200 kHz for the chorus and vibrato and up to 400 kHz for the flanger. Adapted from
-Reverie's Tests/spice/check_bbd.py; the circuit and the method are the same.
+"""Checks Tourbillon's bucket-brigade model (Source/DSP/BucketBrigade.h, the same file as Reverie's apart from the
+namespace) against the same signal path built as a circuit and solved by ngspice, with the chips Tourbillon fits:
+one 512-bucket chip and no compander, clocked up to 200 kHz for the chorus and vibrato and up to 400 kHz for the
+flanger. Reverie's Tests/spice/check_bbd.py with only the chip and the cases changed; keep the two in step.
 
     python3 Tests/spice/check_bbd.py            (needs clang++ and ngspice; looks for ngspice on the PATH and
                                                  in ~/Library/Caches/ngspice-*)
 
 The circuit:
 
-    (NE570 compressor, not fitted here) > 4th-order Butterworth anti-aliasing filter (two unity-gain Sallen-Key stages)
-      > chip clipping > clocked sample-and-hold > N clock periods of delay (three taps for the charge-transfer
-      smear) > the same Butterworth as reconstruction filter > (NE570 expander, not fitted) > output op-amp clipping
+    NE570 compressor > 4th-order Butterworth anti-aliasing filter (two unity-gain Sallen-Key stages)
+      > chip clipping > sampled at each clock tick, N ticks of delay (with the charge-transfer smear's neighbours),
+      held until the next tick > the same Butterworth as reconstruction filter > NE570 expander > output clipping
 
-The filters, the sampling switch and the delay are real circuit elements solved in continuous time, driven by a
-real clock, with an analog signal source; nothing is sampled at the host rate. The delay through the chain is
-exact, as a bucket brigade's is, so it is done between two ngspice runs: the held values are read off after the
-sampling switch and come back, N ticks later, as the steps that drive the reconstruction filter. So this checks the parts of the
+The filters and the compander are circuits solved in continuous time by ngspice, from an analog signal source;
+the chips are sampled at the exact clock ticks, and nothing is sampled at the host rate. So this checks the parts of the
 model that could quietly be wrong: the discretisation of the filters, the timing of each clock tick between host
 samples, the zero-order hold and its images, aliasing when the clock runs slow, and the compander's envelope
 following. The NE570 is its block diagram (a full-wave rectifier into 10 kOhm x 1 uF, driving a gain cell), not a
@@ -75,127 +73,78 @@ def sallen_key(name, inp, out, fc):
     return lines
 
 
-def first_tick(period):
-    """When the clock first ticks. The model's clock is advanced before its first host sample, so it ticks at
-    k * period - 1 / SR; a real chip's clock phase is arbitrary, and the circuit's follows the model's. (In-band
-    tones do not care; the images and aliases a slow clock makes do.) The first tick is the first of these
-    late enough for the switch's pulse to fit before it."""
-    t0 = (-1.0 / SR) % period
-    while t0 < period / 25:
-        t0 += period
-    return t0
-
-
-def held_values(t, v, period, ticks):
-    """The value held after each tick j (0..ticks-1), read halfway to the next tick, where the hold is steady."""
-    out, j, t0 = [], 0, first_tick(period)
-    for k in range(ticks):
-        tk = t0 + (k + 0.5) * period
-        while j + 2 < len(t) and t[j + 1] < tk:
-            j += 1
-        f = 0.0 if t[j + 1] == t[j] else (tk - t[j]) / (t[j + 1] - t[j])
-        out.append(v[j] + min(max(f, 0.0), 1.0) * (v[j + 1] - v[j]))
-    return out
-
-
-def netlist_in(compander, character, delay, clock_max, seconds, signal, outfile):
-    """Pass 1: compressor, anti-aliasing filter, the chips' clipping, and the sampling switch."""
-    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
-    # the switch tracks while its pulse is high and holds from the moment it opens, at each tick; a pulse a
-    # fiftieth of a period wide is never stepped over by the solver (a 10 ns one occasionally was)
-    period = 1.0 / clock
-    width, edge = period / 50, period / 5000
-    t0 = first_tick(period)
-    n = ["* Tourbillon bucket-brigade check, pass 1: into the chips", f"Bx x 0 V = {signal}"]
-    if compander:
-        n += [f"By y 0 V = v(x) * {REF} / max(v(ce), {FLOOR})",
-              "Bce 0 ce I = (abs(v(y)) - v(ce)) / 10k", "Cce ce 0 1u", f".ic v(ce)={FLOOR}"]
-    else:
-        n += ["By y 0 V = v(x)"]
-    n += sallen_key("in", "y", "s", fc)
-    n += [f"Bq q 0 V = v(s) >= 0 ? tanh({drive} * v(s)) / {drive} : v(s) / sqrt(1 + 0.6 * {drive}^2 * v(s)^2)",
-          f"Vclk clk 0 PULSE(0 1 {t0 - width - 1.5 * edge:.15g} {edge} {edge} {width} {period:.15g})",
-          "S1 q h clk 0 sw", ".model sw sw vt=0.5 vh=0 ron=0.1 roff=1e12", "Ch h 0 1n"]
-    n += [".options reltol=1e-6 abstol=1e-12 vntol=1e-9",
-          f".tran {min(1e-6, period / 20):.6g} {seconds} 0 {min(1e-6, period / 20):.6g} uic",
-          ".control", "run", f"wrdata {outfile} v(h)", ".endc", ".end"]
-    return "\n".join(n) + "\n"
-
-
-def netlist_out(compander, character, delay, clock_max, seconds, stairs, outfile):
-    """Pass 2: the chips' output, stepping at each tick to the value `stairs` gives it, then the reconstruction
-    filter, expander and output stage."""
-    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
-    period = 1.0 / clock
-    edge, t0 = period / 5000, first_tick(period)
-    points, last = ["0 0"], 0.0
-    for k, z in enumerate(stairs):
-        if z == last:
-            continue
-        tk = t0 + k * period
-        points += [f"{tk:.15g} {last:.12g}", f"{tk + edge:.15g} {z:.12g}"]
-        last = z
-    n = ["* Tourbillon bucket-brigade check, pass 2: out of the chips"]
-    n += ["Vz z 0 PWL("]
-    n += ["+ " + " ".join(points[i:i + 8]) for i in range(0, len(points), 8)]
-    n += ["+ )"]
-    n += sallen_key("out", "z", "u", fc)
-    if compander:
-        n += ["Bee 0 ee I = (abs(v(u)) - v(ee)) / 10k", "Cee ee 0 1u",
-              f"Bout out 0 V = {RAIL} * tanh(v(u) * max(v(ee), {FLOOR}) / {REF} / {RAIL})",
-              f".ic v(ee)={FLOOR}"]
-    else:
-        n += [f"Bout out 0 V = {RAIL} * tanh(v(u) / {RAIL})"]
-    n += [".options reltol=1e-6 abstol=1e-12 vntol=1e-9",
-          f".tran {min(1e-6, period / 20):.6g} {seconds} 0 {min(1e-6, period / 20):.6g} uic",
-          ".control", "run", f"wrdata {outfile} v(out)", ".endc", ".end"]
-    return "\n".join(n) + "\n"
-
-
-def read_wrdata(path):
+def spice_lines(ngspice, work, name, lines, seconds, node):
+    """Solves a netlist and returns the solver's time points and the voltage at one node."""
+    out, cir = os.path.join(work, name + ".txt"), os.path.join(work, name + ".cir")
+    with open(cir, "w") as f:
+        f.write("\n".join([f"* Tourbillon bucket-brigade check: {name}"] + lines + [
+            ".options reltol=1e-6 abstol=1e-12 vntol=1e-9",
+            f".tran 1u {seconds} 0 1u uic",
+            ".control", "run", f"wrdata {out} v({node})", ".endc", ".end"]) + "\n")
+    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t, v = [], []
-    with open(path) as f:
+    with open(out) as f:
         for line in f:
             a, b = line.split()[:2]
             t.append(float(a)); v.append(float(b))
     return t, v
 
 
-def run_spice(ngspice, work, compander, character, delay, clock_max, seconds, signal):
-    """The circuit in two passes around the delay. The delay itself is exact, as a bucket brigade's is: the
-    charge taken at tick k leaves the chain at tick k + tap. (ngspice has no exact analog delay; its
-    transmission line smears the held steps and drifts in time, worse the longer the delay.)"""
-    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
-    period = 1.0 / clock
-    ticks = int((seconds - first_tick(period)) / period) + 1
-    cir, out = os.path.join(work, "bbd.cir"), os.path.join(work, "spice.txt")
-
-    with open(cir, "w") as f:
-        f.write(netlist_in(compander, character, delay, clock_max, seconds, signal, out))
-    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    held = held_values(*read_wrdata(out), period, ticks)
-
-    # the chain: what leaves at tick k entered at tick k - tap, with the charge the buckets either side left
-    def at(k):
-        return held[k] if 0 <= k < len(held) else 0.0
-    stairs = [(1 - 2 * smear) * at(k - tap) + smear * (at(k - tap - 1) + at(k - tap + 1)) for k in range(ticks)]
-
-    with open(cir, "w") as f:
-        f.write(netlist_out(compander, character, delay, clock_max, seconds, stairs, out))
-    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return read_wrdata(out)
-
-
-def at_samples(t, v, count):
-    """The circuit's output at each host sample instant (linear interpolation between solver points)."""
+def interpolate(t, v, times):
     out, j = [], 0
-    for i in range(count):
-        ti = i / SR
+    for ti in times:
         while j + 2 < len(t) and t[j + 1] < ti:
             j += 1
         f = 0.0 if t[j + 1] == t[j] else (ti - t[j]) / (t[j + 1] - t[j])
         out.append(v[j] + min(max(f, 0.0), 1.0) * (v[j + 1] - v[j]))
     return out
+
+
+def run_spice(ngspice, work, compander, character, delay, clock_max, seconds, signal):
+    """The circuit's output at each host sample instant.
+
+    Solved in two parts around the chips. The chips are an ideal chain of N buckets, so what leaves them at clock
+    tick k is exactly what the input side delivered at tick k - N (with the smear's neighbours): ngspice solves the
+    input side, its output is read at every tick, and the delayed, held steps drive a second ngspice run through
+    the output side. (A transmission line as the delay would do the same in one run, but ngspice's lossless line
+    blurs the held steps over its solver points and adds several microseconds of error over a long delay.)"""
+    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
+    period = 1.0 / clock
+    ticks = int(seconds * clock) + 2
+    # The model's clock ticks fall at k / clock less one host sample (its clock's phase, which only moves the
+    # images, not the echo); the circuit's clock is given the same phase.
+    tick = [k * period - 1.0 / SR for k in range(ticks)]
+
+    first = [f"Bx x 0 V = {signal}"]
+    if compander:
+        first += [f"By y 0 V = v(x) * {REF} / max(v(ce), {FLOOR})",
+                  "Bce 0 ce I = (abs(v(y)) - v(ce)) / 10k", "Cce ce 0 1u", f".ic v(ce)={FLOOR}"]
+    else:
+        first += ["By y 0 V = v(x)"]
+    first += sallen_key("in", "y", "s", fc)
+    first += [f"Bq q 0 V = v(s) >= 0 ? tanh({drive} * v(s)) / {drive} : v(s) / sqrt(1 + 0.6 * {drive}^2 * v(s)^2)",
+              # makes the solver land on every clock tick, where the chips take their samples
+              f"Vclk clk 0 PULSE(0 1 {(period - 1.0 / SR) % period:.15g} 1n 1n 1n {period:.15g})", "Rclk clk 0 1k"]
+    t, v = spice_lines(ngspice, work, "input", first, seconds, "q")
+    q = interpolate(t, v, [max(x, 0.0) for x in tick])
+
+    def bucket(j):
+        return q[j] if 0 <= j < len(q) and tick[j] > 0.0 else 0.0
+    held = [(1 - 2 * smear) * bucket(k - tap) + smear * (bucket(k - tap + 1) + bucket(k - tap - 1)) for k in range(ticks)]
+    points = ["0 0"]
+    for k in range(1, ticks):
+        if tick[k] > 1e-9:
+            points.append(f"{tick[k] - 0.5e-9:.15g} {held[k - 1]:.12g} {tick[k] + 0.5e-9:.15g} {held[k]:.12g}")
+
+    second = ["Vz z 0 PWL(" + points[0]] + ["+ " + p for p in points[1:]] + ["+ )"]
+    second += sallen_key("out", "z", "u", fc)
+    if compander:
+        second += ["Bee 0 ee I = (abs(v(u)) - v(ee)) / 10k", "Cee ee 0 1u",
+                   f"Bout out 0 V = {RAIL} * tanh(v(u) * max(v(ee), {FLOOR}) / {REF} / {RAIL})", f".ic v(ee)={FLOOR}"]
+    else:
+        second += [f"Bout out 0 V = {RAIL} * tanh(v(u) / {RAIL})"]
+    t, v = spice_lines(ngspice, work, "output", second, seconds, "out")
+    return interpolate(t, v, [i / SR for i in range(int(seconds * SR))])
 
 
 def run_model(exe, compander, character, delay, clock_max, seconds, signal):
@@ -220,23 +169,21 @@ def main():
                    check=True)
 
     failures = 0
-    # (what, compander, character, delay samples, seconds, signal, pass if the difference is below this, dB)
     # (what, compander, character, delay samples, clock limit, seconds, signal, pass if the difference is below this, dB)
     # the delays are chosen so the tap lands on a whole bucket
     cases = [
-        ("chorus, 16 ms, clock 32 kHz",          False, 0.4, 768, 200000.0, 0.12, "tones", -50),
-        ("chorus, 4 ms, clock 128 kHz",          False, 0.4, 192, 200000.0, 0.06, "tones", -50),
-        ("chorus, 16 ms, dark character",        False, 1.0, 768, 200000.0, 0.12, "tones", -50),
-        ("flanger, 2 ms, clock 256 kHz",         False, 0.4, 96,  400000.0, 0.04, "tones", -50),
-        ("flanger, 1 ms, clock held at 400 kHz", False, 0.4, 48,  400000.0, 0.04, "tones", -50),
+        ("chorus, 16 ms, clock 32 kHz",              False, 0.4, 768,  200000.0, 0.12, "tones", -50),
+        ("chorus, 4 ms, clock 128 kHz",              False, 0.4, 192,  200000.0, 0.06, "tones", -50),
+        ("chorus, 16 ms, dark character",            False, 1.0, 768,  200000.0, 0.12, "tones", -50),
         ("chorus, 42 ms, clock 12.2 kHz (aliasing)", False, 0.4, 2016, 200000.0, 0.14, "tones", -50),
         ("chorus, 50 ms, clock 10.2 kHz (aliasing)", False, 0.4, 2400, 200000.0, 0.14, "tones", -50),
+        ("flanger, 2 ms, clock 256 kHz",             False, 0.4, 96,   400000.0, 0.04, "tones", -50),
+        ("flanger, 1 ms, clock held at 400 kHz",     False, 0.4, 48,   400000.0, 0.04, "tones", -50),
     ]
     for what, compander, character, delay, clock_max, seconds, signal, limit in cases:
         fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
         count = int(seconds * SR)
-        t, v = run_spice(ngspice, work, compander, character, delay, clock_max, seconds, TONES if signal == "tones" else BURSTS)
-        ref = at_samples(t, v, count)
+        ref = run_spice(ngspice, work, compander, character, delay, clock_max, seconds, TONES if signal == "tones" else BURSTS)
         model = run_model(exe, compander, character, delay, clock_max, seconds, signal)
         if not compander:
             hiss = run_model(exe, compander, character, delay, clock_max, seconds, "silence")
