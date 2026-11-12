@@ -6,8 +6,8 @@ Seven circuits, three voices each:
 
 - **Chorus**: Classic (one bucket-brigade line per side, as in the compact pedals), Dimension (two lines from the mono sum swept in opposition, the subtle studio widener) and Ensemble (three lines per side on interlocking sines plus a fast shimmer, the string machine).
 - **Flanger**: BBD, Through-Zero (a swept copy against a fixed one, cancelling completely as it passes) and Clean, with positive or negative feedback.
-- **Phaser**: 4, 8 or 12 all-pass stages on a JFET-style sweep, with Regen and drive.
-- **Vibe**: four deliberately mismatched phase stages (15 nF, 220 nF, 470 pF, 4.7 nF) lit by one lamp onto photocells, with the lamp's and the cells' lag.
+- **Phaser**: 4, 8 or 12 stages of the classic one-knob pedal, each solved as its circuit (47 nF, 24k in parallel with a linearised JFET, its gate swept over -2.8 to -1.5 V) and checked against ngspice, with Regen and drive.
+- **Vibe**: the four phase stages of the original, each solved as its circuit (a phase splitter with unequal legs driving its own capacitor, 15 nF, 220 nF, 470 pF or 4.7 nF, and a photocell behind a 1 uF DC block) with the gains and photocell ranges measured on an original unit by Darabundit et al. (DAFx-19), checked against ngspice. One lamp lights all four photocells, with the lamp's and the cells' lag.
 - **Tremolo**: Bias (valve), Opto (lamp and photocell) and Harmonic (two bands in opposite phase).
 - **Vibrato**: BBD, Clean and Tape (wow and flutter); Depth is the swing in cents at any rate.
 - **Rotary**: horn and drum behind an 800 Hz crossover, Doppler and level from each rotor at two microphones, rotors that take their time to change speed. Its voices are Slow, Fast and Brake.
@@ -37,10 +37,13 @@ After installing, quit your DAW, run `killall -9 AudioComponentRegistrar`, and r
 
 ## Tests
 
-`Tests/Main.cpp` runs audio through the processor offline and checks bypass and the dry path, LFO rate against Hz and tempo, stereo phase, through-zero cancellation, the phaser's notch positions, vibrato depth in cents at different rates, chorus width, the rotors' acceleration and brake, the bucket-brigade filters after a sample-rate change, click-free switching between every type and voice, a stress matrix over every type, voice, sample rate, block size and layout, the Guide's starting points, saved state and CPU use, then renders screenshots of the interface.
+`Tests/Main.cpp` runs audio through the processor offline and checks bypass and the dry path, LFO rate against Hz and tempo, stereo phase, through-zero cancellation, the phaser's notch positions, vibrato depth in cents at different rates, chorus width, the rotors' acceleration and brake, the bucket-brigade filters after a sample-rate change, the phaser and vibe stages against ngspice, click-free switching between every type and voice, a stress matrix over every type, voice, sample rate, block size and layout, the Guide's starting points, saved state and CPU use, then renders screenshots of the interface.
+
+If ngspice is installed (at `~/Library/Caches/ngspice-44.2`, or wherever `NGSPICE` points), the phaser's and the vibe's four stages are simulated in ngspice, part for part (the phaser with ngspice's own JFET model), while their sweep moves, and compared sample for sample: stepped as finely as ngspice they match to about -100 dB, and at 192 kHz the trapezoidal rule's own error is about -55 dB (phaser) and -65 dB (vibe). Otherwise that check is skipped.
 
 ## Not yet
 
-The circuits are modelled, but unlike Atelier's valves and Lutherie's pedals they are not yet checked against ngspice. The phaser's JFET stages, the vibe's lamp and photocells, and the opto tremolo are the candidates for that.
+- The lamps and photocells (the vibe's and the opto tremolo's) move by this project's own time constants, not a physical model; ngspice has no model of a photocell to check them against. Atelier's opto compressor has a physical model of a photocell that could be shared.
+- The phaser's JFET numbers are chosen, not measured, and the JFETs are modelled in their linear range only: driven very hard, a real one starts to distort, which Drive stands in for.
 
 Built on [JUCE](https://juce.com), which has its own licence terms (AGPLv3 or commercial).

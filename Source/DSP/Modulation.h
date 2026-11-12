@@ -41,21 +41,132 @@ private:
     int mask = 0, w = 0;
 };
 
-/** First-order all-pass, the building block of the phaser and the vibe. */
-struct AllPass
+/** The frequency the trapezoidal rule maps a digital frequency w (radians per sample) onto, so the
+    response of a circuit integrated this way is the analog circuit's response at this frequency. */
+inline double analogOmega (double w, double sampleRate) noexcept
 {
-    float z = 0.0f;
-    static float coef (double sr, double hz) noexcept
+    return 2.0 * sampleRate * std::tan (0.5 * std::min (w, 0.999 * kPi));
+}
+
+//==============================================================================
+/** One stage of the classic one-knob phaser, solved as its circuit.
+
+        in ---||--- P ---(+)                out = 2 v(P) - in     (an op-amp with equal input and
+              47n   |                                              feedback resistors around it)
+                  24k || JFET
+                    |
+                   gnd
+
+    The JFET is the variable resistor. Its drain-gate network gives the gate half the drain voltage,
+    which cancels the square-law term of the JFET's channel, so in its working range the JFET is a
+    plain resistor of conductance 2 beta (Vgs - Vto), set by the gate bias alone; the 24k sets the
+    lowest corner when the JFET is pinched off. The bias sweeps over -2.8 to -1.5 V, the range
+    measured on the pedal by Eichas et al. (DAFx-14). The JFET's own numbers (pinch-off -2.8 V,
+    beta 0.53 mA/V^2, so IDSS 4.2 mA) are this project's choice, set so the corners run from
+    145 Hz to 4.8 kHz; they are not measured parts.
+
+    The capacitor is integrated by the trapezoidal rule (as ngspice does), its voltage being the
+    stage's state, so the stage behaves as the circuit does even while the resistance moves. */
+struct PhaserStage
+{
+    static constexpr double C = 47.0e-9, Rfix = 24.0e3;
+    static constexpr double Vto = -2.8, beta = 5.3e-4, biasSpan = 1.3;
+
+    /** Gate bias at a sweep position (0..1). */
+    static double gateBias (double pos) noexcept        { return Vto + biasSpan * std::clamp (pos, 0.0, 1.0); }
+    /** Conductance from P to ground at a gate bias. */
+    static double conductance (double vgs) noexcept     { return 1.0 / Rfix + 2.0 * beta * std::max (0.0, vgs - Vto); }
+    static double cornerHz (double pos) noexcept        { return conductance (gateBias (pos)) / (2.0 * kPi * C); }
+
+    /** The stage's analog response at angular frequency omega, with its corner at cornerHz. */
+    static std::complex<double> response (double corner, double omega) noexcept
     {
-        const double t = std::tan (kPi * std::clamp (hz, 5.0, 0.45 * sr) / sr);
-        return (float) ((t - 1.0) / (t + 1.0));
+        const std::complex<double> s (0.0, omega / (2.0 * kPi * corner));
+        return (s - 1.0) / (s + 1.0);
     }
-    inline float process (float x, float a) noexcept
+
+    void prepare (double sampleRate) noexcept    { k = 1.0 / (2.0 * sampleRate * C); reset(); }
+    void reset() noexcept                        { hist = 0.0; }
+
+    /** One sample, with conductance G (siemens) from P to ground. */
+    inline double process (double x, double G) noexcept
     {
-        const float y = a * x + z;
-        z = x - a * y;
-        return y;
+        // capacitor voltage vC = x - vP = hist + k i, with i = G vP
+        const double vP = (x - hist) / (1.0 + k * G);
+        hist = (x - vP) + k * G * vP;
+        return 2.0 * vP - x;
     }
+
+    double k = 0.0, hist = 0.0;
+};
+
+//==============================================================================
+/** One stage of the vibe, solved as its circuit (after Darabundit, Wedelich and Bischoff, "Digital
+    grey box model of the Uni-Vibe effects pedal", DAFx-19).
+
+        x --[ -beta ]-- c ---||--- out ---[ LDR + 4.7k ]---||--- e --[ alpha ]-- x
+                             Cp                           1u
+
+    A transistor phase splitter drives the stage from its collector (inverted, gain beta) and its
+    emitter (gain alpha). The phasing capacitor Cp comes off the collector; the photocell, in series
+    with 4.7k, comes off the emitter through a 1 uF DC block. The stage is not an ideal all-pass:
+    the legs' gains differ and the DC block leaves a high shelf that moves with the photocell, which
+    is much of the vibe's throb. Each stage has its own capacitor, gains and photocell range, as
+    measured on an original unit (Table 1 of the paper). Both capacitors are integrated by the
+    trapezoidal rule, as ngspice does. */
+struct VibeStage
+{
+    static constexpr double Cdc = 1.0e-6, R6 = 4.7e3;
+    struct Part { double cp, alpha, beta, ldrMin, ldrMax; };
+    static constexpr Part parts[4] = {
+        { 15.0e-9,  1.01, 1.11, 12.7e3, 2.79e6 },
+        { 220.0e-9, 0.98, 1.09, 6.86e3, 2.59e6 },
+        { 470.0e-12, 0.97, 1.10, 7.69e3, 3.32e6 },
+        { 4.7e-9,   0.95, 1.09, 6.22e3, 4.16e6 },
+    };
+
+    /** Photocell resistance of a stage when the cells are lit to `cell` (0 dark .. 1 fully lit).
+        Bright (voice 1) reaches half the measured lowest resistance, Deep (voice 2) only twice it. */
+    static double ldr (int stage, int voice, double cell) noexcept
+    {
+        const auto& q = parts[stage];
+        const double lo = q.ldrMin * (voice == 1 ? 0.5 : (voice == 2 ? 2.0 : 1.0));
+        return std::exp (std::log (q.ldrMax) - (std::log (q.ldrMax) - std::log (lo)) * std::clamp (cell, 0.0, 1.0));
+    }
+
+    /** The stage's analog response at angular frequency omega, with photocell resistance r. */
+    static std::complex<double> response (int stage, double r, double omega) noexcept
+    {
+        const auto& q = parts[stage];
+        const double kc = q.cp / (q.cp + Cdc), ke = Cdc / (q.cp + Cdc);
+        const double wo = (q.cp + Cdc) / ((r + R6) * q.cp * Cdc);
+        const std::complex<double> s (0.0, omega);
+        return (q.alpha * ke * wo - q.beta * (kc * wo + s)) / (wo + s);
+    }
+
+    void prepare (double sampleRate, int stage) noexcept
+    {
+        part = parts[stage];
+        kP = 1.0 / (2.0 * sampleRate * part.cp);
+        kD = 1.0 / (2.0 * sampleRate * Cdc);
+        reset();
+    }
+    void reset() noexcept   { hP = hD = 0.0; }
+
+    /** One sample, with photocell resistance r (ohms). */
+    inline double process (double x, double r) noexcept
+    {
+        const double vc = -part.beta * x, ve = part.alpha * x;
+        // one loop: e -> Cdc -> (r + R6) -> out -> Cp -> c; each capacitor's voltage is hist + k i
+        const double i = (ve - vc - hD - hP) / (r + R6 + kD + kP);
+        const double vCp = hP + kP * i;
+        hP = vCp + kP * i;
+        hD = hD + 2.0 * kD * i;
+        return vc + vCp;
+    }
+
+    Part part {};
+    double kP = 0.0, kD = 0.0, hP = 0.0, hD = 0.0;
 };
 
 //==============================================================================
@@ -82,16 +193,14 @@ struct Modulator
     {
         float position[2] {};           // sweep position 0..1 (tremolo: gain; vibrato: pitch in cents)
         float delayMs[2] {};            // chorus, flanger, vibrato
-        float breakHz[2] {};            // phaser: the all-pass corner; vibe: the photocell resistance in ohms
+        float breakHz[2] {};            // phaser: the stages' corner; vibe: the first photocell's resistance in ohms
+        float cell[2] {};               // vibe: how far the photocells are lit, 0 dark .. 1 fully lit
         float hornHz = 0.0f, drumHz = 0.0f, hornAngle = 0.0f, drumAngle = 0.0f;
     } state;
 
-    // the vibe's four phase-shift capacitors, in the order the signal meets them
-    static constexpr double vibeCaps[4] = { 15.0e-9, 220.0e-9, 470.0e-12, 4.7e-9 };
-    static constexpr double vibeRmax = 1.0e6;
-    static double vibeRmin (int voice) noexcept     { return voice == 1 ? 12.0e3 : (voice == 2 ? 50.0e3 : 25.0e3); }
     static int phaserStages (int voice) noexcept    { return voice == 1 ? 8 : (voice == 2 ? 12 : 4); }
-    static double phaserHz (float pos) noexcept     { return 70.0 * std::pow (4800.0 / 70.0, std::pow ((double) pos, 1.35)); }
+    static double phaserHz (float pos) noexcept     { return PhaserStage::cornerHz ((double) pos); }
+    static constexpr float vibeTrim = 0.79f;        // -2 dB: the stages gain 0.4 to 3.1 dB over the sweep (that swing is the throb)
     static float flangerMs (float pos) noexcept     { return 0.25f * std::pow (48.0f, pos); }
     static constexpr float tzfReferenceMs = 4.0f;
 
@@ -110,6 +219,8 @@ struct Modulator
         hornCab.setPeak (sr, 2500.0, 0.7, 3.0);
         drumCab.setLowPass (sr, 3500.0, 0.6);
         lampUp = msToCoef (12.0f, sr);
+        for (auto& ch : phaserStage) for (auto& s : ch) s.prepare (sr);
+        for (auto& ch : vibeStage) for (int st = 0; st < 4; ++st) ch[(size_t) st].prepare (sr, st);
         tremLp.reset();
         reset();
     }
@@ -120,13 +231,14 @@ struct Modulator
         for (auto& b : flangerBbd) b.reset();
         for (auto& d : line) d.reset();
         hornLine.reset(); drumLine.reset();
-        for (auto& ch : stages) for (auto& s : ch) s.z = 0.0f;
+        for (auto& ch : phaserStage) for (auto& s : ch) s.reset();
+        for (auto& ch : vibeStage) for (auto& s : ch) s.reset();
         for (auto& f : xoverLo) f.reset();
         for (auto& f : xoverHi) f.reset();
         hornCab.reset(); drumCab.reset(); tremLp.reset();
         fbState[0] = fbState[1] = 0.0f;
         lamp[0] = lamp[1] = 0.0f;
-        logR[0] = logR[1] = (float) std::log (vibeRmax);
+        cell[0] = cell[1] = 0.0f;
         ensPhase = vibPhase = 0.0;
         wow = wowTarget = 0.0f; wowCount = 0; wowSeed = 0x1234567u;
         primedRotor = false;
@@ -312,15 +424,14 @@ private:
             for (int i = 0; i < n; ++i)
             {
                 const float pos = sweep (lfo[ch][i], env[i]);
-                const double hz = phaserHz (pos);
-                const float a = AllPass::coef (sr, hz);
-                float s = in[ch][i] + fb * fbState[ch];
-                s = std::tanh (k * s) / k;
-                for (int st = 0; st < count; ++st) s = stages[ch][(size_t) st].process (s, a);
-                fbState[ch] = s;
-                out[ch][i] = s;
+                const double G = PhaserStage::conductance (PhaserStage::gateBias (pos));
+                float x = in[ch][i] + fb * fbState[ch];
+                double s = std::tanh (k * x) / k;
+                for (int st = 0; st < count; ++st) s = phaserStage[ch][(size_t) st].process (s, G);
+                fbState[ch] = (float) s;
+                out[ch][i] = (float) s;
                 state.position[ch] = pos;
-                state.breakHz[ch] = (float) hz;
+                state.breakHz[ch] = (float) (G / (2.0 * kPi * PhaserStage::C));
             }
         }
     }
@@ -337,7 +448,6 @@ private:
         const float lag = 0.4f + 1.6f * p.character;
         const float lampDown = msToCoef (35.0f * lag, sr);
         const float cellFast = msToCoef (8.0f, sr), cellSlow = msToCoef (60.0f * lag, sr);
-        const float lnMin = (float) std::log (vibeRmin (p.voice)), lnMax = (float) std::log (vibeRmax);
 
         for (int ch = 0; ch < 2; ++ch)
         {
@@ -345,16 +455,16 @@ private:
             {
                 const float drive = sweep (lfo[ch][i], env[i]);
                 lamp[ch] += (drive > lamp[ch] ? lampUp : lampDown) * (drive - lamp[ch]);
-                const float target = lnMax - (lnMax - lnMin) * std::pow (lamp[ch], 0.8f);
-                logR[ch] += (target < logR[ch] ? cellFast : cellSlow) * (target - logR[ch]);
-                const double r = std::exp ((double) logR[ch]);
+                const float target = std::pow (lamp[ch], 0.8f);
+                cell[ch] += (target > cell[ch] ? cellFast : cellSlow) * (target - cell[ch]);
 
-                float s = in[ch][i];
+                double s = in[ch][i];
                 for (int st = 0; st < 4; ++st)
-                    s = stages[ch][(size_t) st].process (s, AllPass::coef (sr, 1.0 / (2.0 * kPi * r * vibeCaps[st])));
-                out[ch][i] = s;
+                    s = vibeStage[ch][(size_t) st].process (s, VibeStage::ldr (st, p.voice, cell[ch]));
+                out[ch][i] = vibeTrim * (float) s;
                 state.position[ch] = lamp[ch];
-                state.breakHz[ch] = (float) r;
+                state.cell[ch] = cell[ch];
+                state.breakHz[ch] = (float) VibeStage::ldr (0, p.voice, cell[ch]);
             }
         }
     }
@@ -525,12 +635,13 @@ private:
 
     BucketBrigade chorusBbd[2][3], flangerBbd[2];
     ModDelay line[2], hornLine, drumLine;
-    std::array<AllPass, 12> stages[2];
+    std::array<PhaserStage, 12> phaserStage[2];
+    std::array<VibeStage, 4> vibeStage[2];
     Biquad xoverLo[2], xoverHi[2], hornCab, drumCab;
     OnePole tremLp;
 
     float fbState[2] {}, fbVoice[2] {};
-    float lamp[2] {}, logR[2] {};
+    float lamp[2] {}, cell[2] {};
     float lampUp = 0.01f;
     double ensPhase = 0.0, vibPhase = 0.0;
     float wow = 0.0f, wowTarget = 0.0f;

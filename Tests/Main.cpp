@@ -242,7 +242,7 @@ int main (int argc, char** argv)
         // Phaser: each first-order stage is -90 degrees at its corner, so 4 stages mixed with the dry
         // signal peak there (-360) and notch where the total is -180 and -540 degrees
         {
-            const float pos = 0.5f;
+            const float pos = 0.3f;
             const double corner = Modulator::phaserHz (pos);
             auto level = [&] (double f)
             {
@@ -255,8 +255,11 @@ int main (int argc, char** argv)
                 return rmsDb (b, 24000, 48000) + 33.01f;     // relative to the input's level
             };
             const double pi = juce::MathConstants<double>::pi;
-            const float lowNotch = level (corner * std::tan (pi / 8.0)), highNotch = level (corner * std::tan (3.0 * pi / 8.0));
-            const float peakAt = level (corner), below = level (corner / 30.0), above = level (corner * 30.0);
+            // the stages are integrated by the trapezoidal rule, which maps analog frequency f to the digital
+            // frequency below; the notches sit where it puts them
+            auto digital = [&] (double f) { return sr / pi * std::atan (pi * f / sr); };
+            const float lowNotch = level (digital (corner * std::tan (pi / 8.0))), highNotch = level (digital (corner * std::tan (3.0 * pi / 8.0)));
+            const float peakAt = level (digital (corner)), below = level (corner / 30.0), above = level (20000.0);
             check (lowNotch < -30.0f && highNotch < -30.0f && std::abs (peakAt) < 0.5f && std::abs (below) < 0.5f && std::abs (above) < 0.5f,
                    "4-stage phaser: two notches either side of the corner (" + juce::String (lowNotch, 1) + " / " + juce::String (highNotch, 1)
                    + " dB), full level at the corner and far from it");
@@ -341,6 +344,149 @@ int main (int argc, char** argv)
             }
             check (std::abs (level[0] - level[1]) < 0.5f && std::abs (level[0] + 15.01f) < 1.0f,
                    "BBD passes 1 kHz at the same level after a sample-rate change (" + juce::String (level[0], 2) + " / " + juce::String (level[1], 2) + " dB)");
+        }
+    }
+
+    if (want ("Circuits against ngspice"))
+    {
+        juce::File ngspice (juce::SystemStats::getEnvironmentVariable ("NGSPICE", {}));
+        if (! ngspice.existsAsFile())
+            ngspice = juce::File::getSpecialLocation (juce::File::userHomeDirectory).getChildFile ("Library/Caches/ngspice-44.2/bin/ngspice");
+
+        if (! ngspice.existsAsFile())
+        {
+            std::cout << "  SKIPPED: ngspice not found (set NGSPICE=/path/to/ngspice)" << std::endl;
+        }
+        else
+        {
+            // 192 kHz, half a second, three tones at once while the sweep moves; the comparison skips the first 50 ms
+            const double rate = 192000.0, T = 1.0 / rate;
+            const int total = (int) (0.5 * rate), from = (int) (0.05 * rate);
+            const char* tones = "0.03*sin(2*pi*220*time)+0.03*sin(2*pi*1370*time)+0.03*sin(2*pi*3100*time)";
+            auto input = [&] (double t)
+            {
+                return 0.03 * (std::sin (twoPi * 220.0 * t) + std::sin (twoPi * 1370.0 * t) + std::sin (twoPi * 3100.0 * t));
+            };
+
+            // runs a deck, whose output node is "out", with ngspice's steps no longer than an eighth of a
+            // sample, and returns the output on the sample grid
+            constexpr int fine = 8;
+            auto simulate = [&] (const juce::String& circuit)
+            {
+                const auto deck = outDir.getChildFile ("circuit.cir"), data = outDir.getChildFile ("circuit.txt");
+                data.deleteFile();
+                const auto step = juce::String::formatted ("%.15e", T), maxStep = juce::String::formatted ("%.15e", T / fine);
+                deck.replaceWithText ("Tourbillon circuit\n" + circuit
+                                      + ".options reltol=1e-7 abstol=1e-15 vntol=1e-10 method=trap\n"
+                                      + ".control\nset wr_singlescale\nset numdgt=15\ntran " + step + " 0.5 0 " + maxStep + "\n"
+                                      + "linearize v(out)\nwrdata circuit.txt v(out)\n.endc\n.end\n");
+                juce::ChildProcess proc;
+                // ngspice writes its data file relative to where it is run
+                const juce::StringArray cmd { "/bin/sh", "-c", "cd " + outDir.getFullPathName().quoted() + " && SPICE_LIB_DIR="
+                                              + ngspice.getParentDirectory().getSiblingFile ("share/ngspice").getFullPathName().quoted()
+                                              + " " + ngspice.getFullPathName().quoted() + " -b circuit.cir > circuit.log 2>&1" };
+                std::vector<double> ref;
+                if (proc.start (cmd) && proc.waitForProcessToFinish (600000))
+                {
+                    juce::StringArray lines;
+                    lines.addLines (data.loadFileAsString());
+                    for (const auto& line : lines)
+                    {
+                        const auto parts = juce::StringArray::fromTokens (line.trim(), " \t", "");
+                        if (parts.size() >= 2) ref.push_back (parts[parts.size() - 1].getDoubleValue());
+                    }
+                }
+                return ref;
+            };
+
+            // The model is run twice: stepped as finely as ngspice, where any difference left means the
+            // circuit is not the same, and at 192 kHz, which adds the trapezoidal rule's own error.
+            // makeModel (rate) gives a function of (time, input) -> output.
+            auto against = [&] (const char* name, const juce::String& circuit, auto&& makeModel)
+            {
+                const auto ref = simulate (circuit);
+                if ((int) ref.size() < total) { check (false, juce::String ("ngspice produced a reference for the ") + name); return; }
+
+                float diff[2] {};
+                for (int pass = 0; pass < 2; ++pass)
+                {
+                    const int over = pass == 0 ? fine : 1;
+                    auto model = makeModel (rate * over);
+                    double err = 0.0, sig = 0.0;
+                    for (int i = 0; i < total * over; ++i)
+                    {
+                        const double t = i * T / over, y = model (t, input (t));
+                        if (i % over != 0 || i / over < from) continue;
+                        const double r = ref[(size_t) (i / over)];
+                        err += (y - r) * (y - r);
+                        sig += r * r;
+                    }
+                    diff[pass] = (float) (10.0 * std::log10 (std::max (1.0e-30, err / sig)));
+                }
+                check (diff[0] < -80.0f, juce::String (name) + ": the same circuit as ngspice (" + juce::String (diff[0], 1)
+                                         + " dB difference when stepped as finely)");
+                check (diff[1] < -40.0f, juce::String (name) + ": " + juce::String (diff[1], 1)
+                                         + " dB from the circuit when run at 192 kHz");
+            };
+
+            // Phaser: four stages, the gate bias swept at 1.5 Hz over 10 to 100 % of its range
+            {
+                auto pos = [] (double t) { return 0.1 + 0.9 * (0.5 + 0.5 * std::sin (twoPi * 1.5 * t)); };
+                juce::String deck;
+                deck << "Bin in 0 V=" << tones << "\n"
+                     << "Bvg vg 0 V=" << PhaserStage::Vto << "+" << PhaserStage::biasSpan << "*(0.1+0.9*(0.5+0.5*sin(2*pi*1.5*time)))\n"
+                     << ".model JX NJF(Vto=" << PhaserStage::Vto << " Beta=" << PhaserStage::beta << " Lambda=0)\n";
+                for (int st = 1; st <= 4; ++st)
+                {
+                    const juce::String a = st == 1 ? "in" : "o" + juce::String (st - 1), b = st == 4 ? "out" : "o" + juce::String (st), n (st);
+                    // the drain-gate network, idealised: the gate sits at its bias plus half the drain voltage
+                    deck << "C" << n << " " << a << " p" << n << " " << PhaserStage::C << "\n"
+                         << "R" << n << " p" << n << " 0 " << PhaserStage::Rfix << "\n"
+                         << "Bg" << n << " g" << n << " 0 V=V(vg)+V(p" << n << ")/2\n"
+                         << "J" << n << " p" << n << " g" << n << " 0 JX\n"
+                         << "Bo" << n << " " << b << " 0 V=2*V(p" << n << ")-V(" << a << ")\n";
+                }
+                against ("phaser, 4 stages swept", deck, [&] (double r)
+                {
+                    std::array<PhaserStage, 4> stages;
+                    for (auto& s : stages) s.prepare (r);
+                    return [=] (double t, double x) mutable
+                    {
+                        const double G = PhaserStage::conductance (PhaserStage::gateBias (pos (t)));
+                        for (auto& s : stages) x = s.process (x, G);
+                        return x;
+                    };
+                });
+            }
+
+            // Vibe: the four stages, the photocells swept at 3 Hz between 5 and 95 % lit
+            {
+                auto cell = [] (double t) { return 0.05 + 0.9 * (0.5 + 0.5 * std::sin (twoPi * 3.0 * t)); };
+                juce::String deck;
+                deck << "Bin in 0 V=" << tones << "\n";
+                for (int st = 0; st < 4; ++st)
+                {
+                    const auto& q = VibeStage::parts[st];
+                    const juce::String a = st == 0 ? "in" : "o" + juce::String (st), b = st == 3 ? "out" : "o" + juce::String (st + 1), n (st + 1);
+                    const juce::String ldr = juce::String (q.ldrMax, 10) + "*exp(" + juce::String (std::log (q.ldrMin / q.ldrMax), 15)
+                                           + "*(0.05+0.9*(0.5+0.5*sin(2*pi*3*time))))";
+                    deck << "Ec" << n << " c" << n << " 0 " << a << " 0 " << -q.beta << "\n"
+                         << "Ee" << n << " e" << n << " 0 " << a << " 0 " << q.alpha << "\n"
+                         << "Cp" << n << " c" << n << " " << b << " " << juce::String (q.cp, 15) << "\n"
+                         << "Cd" << n << " e" << n << " m" << n << " " << VibeStage::Cdc << "\n"
+                         << "Br" << n << " m" << n << " " << b << " I=V(m" << n << "," << b << ")/(" << ldr << "+" << VibeStage::R6 << ")\n";
+                }
+                against ("vibe, 4 stages swept", deck, [&] (double r)
+                {
+                    std::array<VibeStage, 4> stages;
+                    for (int st = 0; st < 4; ++st) stages[(size_t) st].prepare (r, st);
+                    return [=] (double t, double x) mutable
+                    {
+                        for (int st = 0; st < 4; ++st) x = stages[(size_t) st].process (x, VibeStage::ldr (st, 0, cell (t)));
+                        return x;
+                    };
+                });
+            }
         }
     }
 

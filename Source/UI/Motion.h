@@ -193,22 +193,15 @@ private:
             }
             if (type == phaser)
             {
-                const double hz = (double) proc.meters.breakHz[ch].load (std::memory_order_relaxed);
-                const double t = std::tan (juce::MathConstants<double>::pi * juce::jlimit (5.0, 0.45 * rate, hz) / rate);
-                const double a = (t - 1.0) / (t + 1.0);
-                const C ap = std::pow ((a + z1) / (1.0 + a * z1), Modulator::phaserStages (voice));
+                const double hz = juce::jmax (1.0, (double) proc.meters.breakHz[ch].load (std::memory_order_relaxed));
+                const C ap = std::pow (PhaserStage::response (hz, analogOmega (w, rate)), Modulator::phaserStages (voice));
                 return ap / (1.0 - (double) fb * ap * z1);
             }
-            // vibe: four stages with their own capacitors and the photocells' present resistance
-            const double ohms = juce::jmax (1.0, (double) proc.meters.breakHz[ch].load (std::memory_order_relaxed));
-            C h (1.0);
-            for (double cap : Modulator::vibeCaps)
-            {
-                const double hz = 1.0 / (2.0 * juce::MathConstants<double>::pi * ohms * cap);
-                const double t = std::tan (juce::MathConstants<double>::pi * juce::jlimit (5.0, 0.45 * rate, hz) / rate);
-                const double a = (t - 1.0) / (t + 1.0);
-                h *= (a + z1) / (1.0 + a * z1);
-            }
+            // vibe: four stages with their own capacitors, gains and photocells, lit as they are now
+            const double cell = (double) proc.meters.cell[ch].load (std::memory_order_relaxed);
+            C h (Modulator::vibeTrim);
+            for (int st = 0; st < 4; ++st)
+                h *= VibeStage::response (st, VibeStage::ldr (st, voice, cell), analogOmega (w, rate));
             return h;
         };
 

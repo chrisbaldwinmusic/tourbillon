@@ -338,6 +338,7 @@ void TourbillonProcessor::processEffect (float* l, float* r, const float* kl, co
         meters.position[ch].store (s.position[ch], std::memory_order_relaxed);
         meters.delayMs[ch].store (s.delayMs[ch], std::memory_order_relaxed);
         meters.breakHz[ch].store (s.breakHz[ch], std::memory_order_relaxed);
+        meters.cell[ch].store (s.cell[ch], std::memory_order_relaxed);
     }
     meters.hornHz.store (s.hornHz, std::memory_order_relaxed);
     meters.drumHz.store (s.drumHz, std::memory_order_relaxed);

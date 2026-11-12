@@ -79,6 +79,7 @@ public:
         std::atomic<float> position[2] { { 0.0f }, { 0.0f } };
         std::atomic<float> delayMs[2] { { 0.0f }, { 0.0f } };
         std::atomic<float> breakHz[2] { { 0.0f }, { 0.0f } };
+        std::atomic<float> cell[2] { { 0.0f }, { 0.0f } };
         std::atomic<float> hornHz { 0.0f }, drumHz { 0.0f }, hornAngle { 0.0f }, drumAngle { 0.0f };
     } meters;
 
