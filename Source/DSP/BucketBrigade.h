@@ -6,9 +6,10 @@
 
 namespace tourbillon
 {
-/** The chips fitted to a BucketBrigade. Tourbillon's chorus and vibrato use one 1024-stage chip (MN3007 class,
-    512 buckets) without a compander, as the classic chorus pedals do; the flanger runs the same chip with a
-    faster clock. */
+/** The chips fitted to a BucketBrigade. Reverie's Analog delay uses the default: two MN3005s behind an NE570
+    compander, as in the long-delay pedals. Tourbillon (the sibling modulation plugin) fits one 1024-stage chip
+    without a compander for its chorus and vibrato, as the classic chorus pedals do. Keep the two copies of this
+    file the same apart from the namespace. */
 struct BbdChip
 {
     int buckets = 4096;                         // 8192 stages: two MN3005s; one sample leaves per clock cycle
@@ -55,8 +56,8 @@ struct BucketBrigade
         line.assign ((size_t) n, 0.0f);
         mask = n - 1;
         compCoef = msToCoef (10.0f, sr);           // NE570 rectifier: 10 kOhm x 1 uF
-        polesReady = false;                         // the filters depend on the sample rate, so always redesign them here
-        setCharacter (character >= 0.0f ? character : 0.4f);
+        polesReady = false;                         // the filters depend on the sample rate, so always redesign them
+        setCharacter (character < 0.0f ? 0.4f : character);
         reset();
     }
 
@@ -72,7 +73,7 @@ struct BucketBrigade
         noiseSeed = 0x2545f491u;
     }
 
-    /** 0..1: lower filter cutoffs, harder drive into the chips, more hiss. */
+    /** 0..1: lower filter cutoffs, harder drive into the chips, more charge left behind at each stage, more hiss. */
     void setCharacter (float c) noexcept
     {
         c = std::clamp (c, 0.0f, 1.0f);
@@ -82,6 +83,14 @@ struct BucketBrigade
 
         drive = 1.0f + 2.0f * c;
         noiseLevel = dbToGain ((chip.compander ? -84.0f : -96.0f) + 12.0f * c);
+
+        // Charge-transfer loss: each stage passes on (1 - e) of its charge and the rest follows a
+        // clock later. Over the whole chain that is close to exp (-N e (1 - cos w)) at the stage rate,
+        // which the read below matches with a three-bucket smoothing around the tap (no extra delay).
+        // This gentle low-pass is applied once per pass, so it is what keeps each repeat duller than
+        // the one before. e runs from fresh chips (0.25e-4) to tired ones (2e-4).
+        const double inefficiency = 0.25e-4 + 1.75e-4 * c;
+        smear = (float) (2.0 * buckets * inefficiency / 8.0);
 
         // both filters are fourth-order Butterworth low-pass at the same corner, as in most pedals
         // (chorus pedals run a little brighter: their clock never drops as low as a long echo's)
@@ -163,8 +172,12 @@ struct BucketBrigade
             // output: the sample that has reached the tap end of the chain, held until the next tick
             const int ti = (int) tap;
             const float f = (float) (tap - ti);
-            const float a = line[(size_t) ((w - 1 - ti) & mask)], b = line[(size_t) ((w - 2 - ti) & mask)];
-            const float out = a + f * (b - a);
+            auto at = [this, ti, f] (int k)     // k buckets either side of the tap
+            {
+                const float a = line[(size_t) ((w - 1 - ti - k) & mask)], b = line[(size_t) ((w - 2 - ti - k) & mask)];
+                return a + f * (b - a);
+            };
+            const float out = (1.0f - 2.0f * smear) * at (0) + smear * (at (-1) + at (1));
             const double step = (double) (out - held);
             held = out;
             for (int m = 0; m < 2; ++m) xout[m] += step * e[m];
@@ -214,6 +227,7 @@ private:
     Chip chip;
     int buckets = 4096;
     double clockMin = 10000.0, clockMax = 100000.0;
+
     double sr = 48000.0, T = 1.0 / 48000.0;
     std::vector<float> line;
     int mask = 0, w = 0;
@@ -223,7 +237,7 @@ private:
     double inGain = 1.0, outDc = 1.0, groupDelay = 0.0;
     float held = 0.0f;
 
-    float character = -1.0f, drive = 1.0f, noiseLevel = 0.0f;
+    float character = -1.0f, drive = 1.0f, noiseLevel = 0.0f, smear = 0.0f;
     bool polesReady = false;
     float compEnv = 0.0f, expEnv = 0.0f, compCoef = 0.01f;
     uint32_t noiseSeed = 0x2545f491u;

@@ -3,6 +3,7 @@
 #include "../Parameters.h"
 #include "BucketBrigade.h"
 #include "Common.h"
+#include "Photocell.h"
 
 namespace tourbillon
 {
@@ -125,13 +126,14 @@ struct VibeStage
         { 4.7e-9,   0.95, 1.09, 6.22e3, 4.16e6 },
     };
 
-    /** Photocell resistance of a stage when the cells are lit to `cell` (0 dark .. 1 fully lit).
-        Bright (voice 1) reaches half the measured lowest resistance, Deep (voice 2) only twice it. */
+    /** Photocell resistance of a stage with the cells' carrier count `cell` (0 dark .. 1 fully lit; see
+        LampCell). Each cell runs from its measured highest resistance to its measured lowest, its own share
+        of the lamp's light being in those numbers. Bright (voice 1) reaches half the lowest, Deep (voice 2)
+        only twice it. */
     static double ldr (int stage, int voice, double cell) noexcept
     {
         const auto& q = parts[stage];
-        const double lo = q.ldrMin * (voice == 1 ? 0.5 : (voice == 2 ? 2.0 : 1.0));
-        return std::exp (std::log (q.ldrMax) - (std::log (q.ldrMax) - std::log (lo)) * std::clamp (cell, 0.0, 1.0));
+        return LampCell::resistance (q.ldrMin * (voice == 1 ? 0.5 : (voice == 2 ? 2.0 : 1.0)), q.ldrMax, cell);
     }
 
     /** The stage's analog response at angular frequency omega, with photocell resistance r. */
@@ -218,7 +220,7 @@ struct Modulator
         for (auto& f : xoverHi) f.setHighPass (sr, 800.0, 0.7071);
         hornCab.setPeak (sr, 2500.0, 0.7, 3.0);
         drumCab.setLowPass (sr, 3500.0, 0.6);
-        lampUp = msToCoef (12.0f, sr);
+        for (auto& l : lampCell) l.prepare (sr);
         for (auto& ch : phaserStage) for (auto& s : ch) s.prepare (sr);
         for (auto& ch : vibeStage) for (int st = 0; st < 4; ++st) ch[(size_t) st].prepare (sr, st);
         tremLp.reset();
@@ -237,8 +239,7 @@ struct Modulator
         for (auto& f : xoverHi) f.reset();
         hornCab.reset(); drumCab.reset(); tremLp.reset();
         fbState[0] = fbState[1] = 0.0f;
-        lamp[0] = lamp[1] = 0.0f;
-        cell[0] = cell[1] = 0.0f;
+        for (auto& l : lampCell) l.reset();
         ensPhase = vibPhase = 0.0;
         wow = wowTarget = 0.0f; wowCount = 0; wowSeed = 0x1234567u;
         primedRotor = false;
@@ -445,26 +446,23 @@ private:
         set the photocells: Bright reaches lower resistance, Deep stays darker. */
     void runVibe (const float* const* in, float* const* out, const float* const* lfo, const float* env, int n) noexcept
     {
-        const float lag = 0.4f + 1.6f * p.character;
-        const float lampDown = msToCoef (35.0f * lag, sr);
-        const float cellFast = msToCoef (8.0f, sr), cellSlow = msToCoef (60.0f * lag, sr);
+        for (auto& l : lampCell) l.setThermalTime (lampTime (p.character));
 
         for (int ch = 0; ch < 2; ++ch)
         {
+            auto& lc = lampCell[ch];
             for (int i = 0; i < n; ++i)
             {
-                const float drive = sweep (lfo[ch][i], env[i]);
-                lamp[ch] += (drive > lamp[ch] ? lampUp : lampDown) * (drive - lamp[ch]);
-                const float target = std::pow (lamp[ch], 0.8f);
-                cell[ch] += (target > cell[ch] ? cellFast : cellSlow) * (target - cell[ch]);
+                lc.step (sweep (lfo[ch][i], env[i]));       // the LFO's voltage across the lamp
+                const double c = lc.cell();
 
                 double s = in[ch][i];
                 for (int st = 0; st < 4; ++st)
-                    s = vibeStage[ch][(size_t) st].process (s, VibeStage::ldr (st, p.voice, cell[ch]));
+                    s = vibeStage[ch][(size_t) st].process (s, VibeStage::ldr (st, p.voice, c));
                 out[ch][i] = vibeTrim * (float) s;
-                state.position[ch] = lamp[ch];
-                state.cell[ch] = cell[ch];
-                state.breakHz[ch] = (float) VibeStage::ldr (0, p.voice, cell[ch]);
+                state.position[ch] = (float) lc.glow();
+                state.cell[ch] = (float) c;
+                state.breakHz[ch] = (float) VibeStage::ldr (0, p.voice, c);
             }
         }
     }
@@ -480,7 +478,8 @@ private:
     void runTremolo (const float* const* in, float* const* out, const float* const* lfo, const float* env, int n) noexcept
     {
         const float kDrive = 0.2f + 2.5f * p.character;
-        const float optoDown = msToCoef (6.0f + 60.0f * p.character, sr), optoUp = msToCoef (3.0f, sr);
+        if (p.voice == 1)
+            for (auto& l : lampCell) l.setThermalTime (lampTime (p.character));
         tremLp.setCutoff (sr, 300.0 + 1200.0 * p.character);
 
         for (int ch = 0; ch < 2; ++ch)
@@ -494,8 +493,16 @@ private:
 
                 if (p.voice == 1)       // opto
                 {
-                    lamp[ch] += (u > lamp[ch] ? optoUp : optoDown) * (u - lamp[ch]);
-                    g = 1.0f - d * (1.0f - std::pow (lamp[ch], 0.7f));
+                    // the lamp lights on the quiet half of the cycle; its photocell shunts the signal to ground
+                    // after a series resistor. Depth sets the lamp's voltage as sqrt (depth), which spreads the
+                    // dips evenly over the control (a filament at a quarter voltage hardly glows). The cell
+                    // never quite lets go between pulses, so the loud half sits a few dB down, as on the amps;
+                    // the stage after it makes up 5 dB x sqrt (depth), keeping it near the dry level.
+                    auto& lc = lampCell[ch];
+                    const float drive = std::sqrt (d);
+                    lc.step (drive * (1.0f - u));
+                    const double r = LampCell::resistance (optoCellMin, optoCellMax, lc.cell());
+                    g = (float) (r / (optoSeries + r) * (optoSeries + optoCellMax) / optoCellMax) * dbToGain (5.0f * drive);
                     y = x * g;
                 }
                 else if (p.voice == 2)  // harmonic
@@ -641,8 +648,11 @@ private:
     OnePole tremLp;
 
     float fbState[2] {}, fbVoice[2] {};
-    float lamp[2] {}, cell[2] {};
-    float lampUp = 0.01f;
+    LampCell lampCell[2];
+    // the opto tremolo's divider: 100k in series, then a photocell like the vibe's to ground
+    static constexpr double optoSeries = 100.0e3, optoCellMin = 6.86e3, optoCellMax = 2.59e6;
+    /** The lamp's thermal time for Character (Lag): a small fast bulb to a big slow one. */
+    static double lampTime (float character) noexcept     { return 0.010 + 0.040 * (double) character; }
     double ensPhase = 0.0, vibPhase = 0.0;
     float wow = 0.0f, wowTarget = 0.0f;
     int wowCount = 0;

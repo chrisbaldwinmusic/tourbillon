@@ -378,7 +378,8 @@ int main (int argc, char** argv)
                 const auto step = juce::String::formatted ("%.15e", T), maxStep = juce::String::formatted ("%.15e", T / fine);
                 deck.replaceWithText ("Tourbillon circuit\n" + circuit
                                       + ".options reltol=1e-7 abstol=1e-15 vntol=1e-10 method=trap\n"
-                                      + ".control\nset wr_singlescale\nset numdgt=15\ntran " + step + " 0.5 0 " + maxStep + "\n"
+                                      + ".control\nset wr_singlescale\nset numdgt=15\ntran " + step + " 0.5 0 " + maxStep
+                                      + (circuit.contains (".ic ") ? " uic" : "") + "\n"
                                       + "linearize v(out)\nwrdata circuit.txt v(out)\n.endc\n.end\n");
                 juce::ChildProcess proc;
                 // ngspice writes its data file relative to where it is run
@@ -468,7 +469,7 @@ int main (int argc, char** argv)
                 {
                     const auto& q = VibeStage::parts[st];
                     const juce::String a = st == 0 ? "in" : "o" + juce::String (st), b = st == 3 ? "out" : "o" + juce::String (st + 1), n (st + 1);
-                    const juce::String ldr = juce::String (q.ldrMax, 10) + "*exp(" + juce::String (std::log (q.ldrMin / q.ldrMax), 15)
+                    const juce::String ldr = "1/(" + juce::String::formatted ("%.15e", 1.0 / q.ldrMax) + "+" + juce::String::formatted ("%.15e", 1.0 / q.ldrMin - 1.0 / q.ldrMax)
                                            + "*(0.05+0.9*(0.5+0.5*sin(2*pi*3*time))))";
                     deck << "Ec" << n << " c" << n << " 0 " << a << " 0 " << -q.beta << "\n"
                          << "Ee" << n << " e" << n << " 0 " << a << " 0 " << q.alpha << "\n"
@@ -485,6 +486,28 @@ int main (int argc, char** argv)
                         for (int st = 0; st < 4; ++st) x = stages[(size_t) st].process (x, VibeStage::ldr (st, 0, cell (t)));
                         return x;
                     };
+                });
+            }
+
+            // The lamp and photocell: filament temperature and carriers as two capacitors charged by their rates,
+            // the lamp's voltage a 3 Hz sine from nearly off to full; the output is the carrier count
+            {
+                auto volts = [] (double t) { return 0.55 + 0.45 * std::sin (twoPi * 3.0 * t); };
+                const double tau = 0.026, a4 = std::pow (LampCell::ambient, 4.0);
+                juce::String deck;
+                deck << "Bv v 0 V=0.55+0.45*sin(2*pi*3*time)\n"
+                     << "Ct t 0 " << tau << "\n"
+                     << "Bt 0 t I=V(v)*V(v)*pwr(V(t),-1.2)-" << juce::String::formatted ("%.15e", LampCell::radiate) << "*(pwr(V(t),4)-" << juce::String::formatted ("%.15e", a4) << ")\n"
+                     << "Bl l 0 V=exp(-" << LampCell::wien << "*(1/V(t)-1))\n"
+                     << "Cn out 0 1\n"
+                     << "Bn 0 out I=" << juce::String::formatted ("%.15e", LampCell::genRate) << "*V(l)-V(out)/" << LampCell::lifetime << "-" << LampCell::pairRate << "*V(out)*V(out)\n"
+                     << ".ic v(t)=" << LampCell::ambient << " v(out)=0\n";
+                against ("lamp and photocell", deck, [&] (double r)
+                {
+                    LampCell lc;
+                    lc.prepare (r);
+                    lc.setThermalTime (tau);
+                    return [=] (double t, double) mutable { lc.step (volts (t)); return lc.cell(); };
                 });
             }
         }
