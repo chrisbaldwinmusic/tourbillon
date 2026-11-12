@@ -14,7 +14,9 @@ The circuit:
       smear) > the same Butterworth as reconstruction filter > (NE570 expander, not fitted) > output op-amp clipping
 
 The filters, the sampling switch and the delay are real circuit elements solved in continuous time, driven by a
-real clock, with an analog signal source; nothing is sampled at the host rate. So this checks the parts of the
+real clock, with an analog signal source; nothing is sampled at the host rate. The delay through the chain is
+exact, as a bucket brigade's is, so it is done between two ngspice runs: the held values are read off after the
+sampling switch and come back, N ticks later, as the steps that drive the reconstruction filter. So this checks the parts of the
 model that could quietly be wrong: the discretisation of the filters, the timing of each clock tick between host
 samples, the zero-order hold and its images, aliasing when the clock runs slow, and the compander's envelope
 following. The NE570 is its block diagram (a full-wave rectifier into 10 kOhm x 1 uF, driving a gain cell), not a
@@ -73,37 +75,75 @@ def sallen_key(name, inp, out, fc):
     return lines
 
 
-def netlist(compander, character, delay, clock_max, seconds, signal, outfile):
+def first_tick(period):
+    """When the clock first ticks. The model's clock is advanced before its first host sample, so it ticks at
+    k * period - 1 / SR; a real chip's clock phase is arbitrary, and the circuit's follows the model's. (In-band
+    tones do not care; the images and aliases a slow clock makes do.) The first tick is the first of these
+    late enough for the switch's pulse to fit before it."""
+    t0 = (-1.0 / SR) % period
+    while t0 < period / 25:
+        t0 += period
+    return t0
+
+
+def held_values(t, v, period, ticks):
+    """The value held after each tick j (0..ticks-1), read halfway to the next tick, where the hold is steady."""
+    out, j, t0 = [], 0, first_tick(period)
+    for k in range(ticks):
+        tk = t0 + (k + 0.5) * period
+        while j + 2 < len(t) and t[j + 1] < tk:
+            j += 1
+        f = 0.0 if t[j + 1] == t[j] else (tk - t[j]) / (t[j + 1] - t[j])
+        out.append(v[j] + min(max(f, 0.0), 1.0) * (v[j + 1] - v[j]))
+    return out
+
+
+def netlist_in(compander, character, delay, clock_max, seconds, signal, outfile):
+    """Pass 1: compressor, anti-aliasing filter, the chips' clipping, and the sampling switch."""
     fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
-    # Sample and hold in two stages, as a real one is built. The first switch tracks the input while its pulse
-    # is high and holds from the moment it opens, at k * period; the second then copies that held value while
-    # the first stays open, so the output steps exactly at the tick. (One switch alone tracks the input for the
-    # whole pulse, putting each step a pulse width early; and a pulse narrow enough for that not to matter is
-    # occasionally stepped over by the solver, losing a tick.)
+    # the switch tracks while its pulse is high and holds from the moment it opens, at each tick; a pulse a
+    # fiftieth of a period wide is never stepped over by the solver (a 10 ns one occasionally was)
     period = 1.0 / clock
     width, edge = period / 50, period / 5000
-    n = ["* Tourbillon bucket-brigade check", f"Bx x 0 V = {signal}"]
+    t0 = first_tick(period)
+    n = ["* Tourbillon bucket-brigade check, pass 1: into the chips", f"Bx x 0 V = {signal}"]
     if compander:
         n += [f"By y 0 V = v(x) * {REF} / max(v(ce), {FLOOR})",
-              "Bce 0 ce I = (abs(v(y)) - v(ce)) / 10k", "Cce ce 0 1u"]
+              "Bce 0 ce I = (abs(v(y)) - v(ce)) / 10k", "Cce ce 0 1u", f".ic v(ce)={FLOOR}"]
     else:
         n += ["By y 0 V = v(x)"]
     n += sallen_key("in", "y", "s", fc)
     n += [f"Bq q 0 V = v(s) >= 0 ? tanh({drive} * v(s)) / {drive} : v(s) / sqrt(1 + 0.6 * {drive}^2 * v(s)^2)",
-          # the switch opens at each clock tick, k * period
-          f"Vclk clk 0 PULSE(0 1 {period - width - 1.5 * edge:.12g} {edge} {edge} {width} {period:.12g})",
-          "S1 q h clk 0 sw", ".model sw sw vt=0.5 vh=0 ron=0.1 roff=1e12", "Ch h 0 1n", "Eh h1 0 h 0 1",
-          f"Vclk2 clk2 0 PULSE(0 1 {period + 2 * edge:.12g} {edge} {edge} {period / 4:.12g} {period:.12g})",
-          "S2 h1 h2 clk2 0 sw", "Ch2 h2 0 1n", "Eh2 hb 0 h2 0 1"]
-    for k, taps in (("m", tap - 1), ("c", tap), ("p", tap + 1)):
-        n += [f"Ed{k} d{k} 0 hb 0 2", f"Rs{k} d{k} t{k} 50",
-              f"T{k} t{k} 0 o{k} 0 Z0=50 TD={taps * period:.15g}", f"Rl{k} o{k} 0 50"]
-    n += [f"Bz z 0 V = {1 - 2 * smear} * v(oc) + {smear} * (v(om) + v(op))"]
+          f"Vclk clk 0 PULSE(0 1 {t0 - width - 1.5 * edge:.15g} {edge} {edge} {width} {period:.15g})",
+          "S1 q h clk 0 sw", ".model sw sw vt=0.5 vh=0 ron=0.1 roff=1e12", "Ch h 0 1n"]
+    n += [".options reltol=1e-6 abstol=1e-12 vntol=1e-9",
+          f".tran {min(1e-6, period / 20):.6g} {seconds} 0 {min(1e-6, period / 20):.6g} uic",
+          ".control", "run", f"wrdata {outfile} v(h)", ".endc", ".end"]
+    return "\n".join(n) + "\n"
+
+
+def netlist_out(compander, character, delay, clock_max, seconds, stairs, outfile):
+    """Pass 2: the chips' output, stepping at each tick to the value `stairs` gives it, then the reconstruction
+    filter, expander and output stage."""
+    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
+    period = 1.0 / clock
+    edge, t0 = period / 5000, first_tick(period)
+    points, last = ["0 0"], 0.0
+    for k, z in enumerate(stairs):
+        if z == last:
+            continue
+        tk = t0 + k * period
+        points += [f"{tk:.15g} {last:.12g}", f"{tk + edge:.15g} {z:.12g}"]
+        last = z
+    n = ["* Tourbillon bucket-brigade check, pass 2: out of the chips"]
+    n += ["Vz z 0 PWL("]
+    n += ["+ " + " ".join(points[i:i + 8]) for i in range(0, len(points), 8)]
+    n += ["+ )"]
     n += sallen_key("out", "z", "u", fc)
     if compander:
         n += ["Bee 0 ee I = (abs(v(u)) - v(ee)) / 10k", "Cee ee 0 1u",
               f"Bout out 0 V = {RAIL} * tanh(v(u) * max(v(ee), {FLOOR}) / {REF} / {RAIL})",
-              f".ic v(ce)={FLOOR} v(ee)={FLOOR}"]
+              f".ic v(ee)={FLOOR}"]
     else:
         n += [f"Bout out 0 V = {RAIL} * tanh(v(u) / {RAIL})"]
     n += [".options reltol=1e-6 abstol=1e-12 vntol=1e-9",
@@ -112,18 +152,38 @@ def netlist(compander, character, delay, clock_max, seconds, signal, outfile):
     return "\n".join(n) + "\n"
 
 
-def run_spice(ngspice, work, *args):
-    out = os.path.join(work, "spice.txt")
-    cir = os.path.join(work, "bbd.cir")
-    with open(cir, "w") as f:
-        f.write(netlist(*args, out))
-    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def read_wrdata(path):
     t, v = [], []
-    with open(out) as f:
+    with open(path) as f:
         for line in f:
             a, b = line.split()[:2]
             t.append(float(a)); v.append(float(b))
     return t, v
+
+
+def run_spice(ngspice, work, compander, character, delay, clock_max, seconds, signal):
+    """The circuit in two passes around the delay. The delay itself is exact, as a bucket brigade's is: the
+    charge taken at tick k leaves the chain at tick k + tap. (ngspice has no exact analog delay; its
+    transmission line smears the held steps and drifts in time, worse the longer the delay.)"""
+    fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
+    period = 1.0 / clock
+    ticks = int((seconds - first_tick(period)) / period) + 1
+    cir, out = os.path.join(work, "bbd.cir"), os.path.join(work, "spice.txt")
+
+    with open(cir, "w") as f:
+        f.write(netlist_in(compander, character, delay, clock_max, seconds, signal, out))
+    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    held = held_values(*read_wrdata(out), period, ticks)
+
+    # the chain: what leaves at tick k entered at tick k - tap, with the charge the buckets either side left
+    def at(k):
+        return held[k] if 0 <= k < len(held) else 0.0
+    stairs = [(1 - 2 * smear) * at(k - tap) + smear * (at(k - tap - 1) + at(k - tap + 1)) for k in range(ticks)]
+
+    with open(cir, "w") as f:
+        f.write(netlist_out(compander, character, delay, clock_max, seconds, stairs, out))
+    subprocess.run([ngspice, "-b", cir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return read_wrdata(out)
 
 
 def at_samples(t, v, count):
@@ -169,6 +229,8 @@ def main():
         ("chorus, 16 ms, dark character",        False, 1.0, 768, 200000.0, 0.12, "tones", -50),
         ("flanger, 2 ms, clock 256 kHz",         False, 0.4, 96,  400000.0, 0.04, "tones", -50),
         ("flanger, 1 ms, clock held at 400 kHz", False, 0.4, 48,  400000.0, 0.04, "tones", -50),
+        ("chorus, 42 ms, clock 12.2 kHz (aliasing)", False, 0.4, 2016, 200000.0, 0.14, "tones", -50),
+        ("chorus, 50 ms, clock 10.2 kHz (aliasing)", False, 0.4, 2400, 200000.0, 0.14, "tones", -50),
     ]
     for what, compander, character, delay, clock_max, seconds, signal, limit in cases:
         fc, smear, drive, clock, tap = chip_settings(compander, character, delay, clock_max)
