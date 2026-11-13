@@ -1,3 +1,5 @@
+> **This repository has moved.** Tourbillon is now developed in the Channel Audio monorepo, [chrisbaldwinmusic/channelaudio](https://github.com/chrisbaldwinmusic/channelaudio), in the `Tourbillon/` folder, with its full history. This repository is archived and kept for reference only.
+
 # Tourbillon
 
 A boutique modulation plugin: chorus to rotary speaker in one unit. AU, VST3 and Standalone, built with JUCE. A sibling of Atelier (the channel strip), Reverie (delay and reverb) and Lutherie (pedals and amps), built the same way.
